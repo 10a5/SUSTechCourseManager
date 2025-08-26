@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, QV
                            QTextEdit, QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
                            QListWidget, QListWidgetItem, QDialog, QDialogButtonBox)
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor, QBrush
 import requests
 import os
 import sys
@@ -44,6 +44,7 @@ class CourseSchedulerApp(QMainWindow):
         self.filtered_courses = []
         self.schedules = []
         self.current_schedule_idx = -1
+        self.locked_time_slots = np.zeros((16, 7, 11), dtype=bool)
         
         self.init_ui()
         
@@ -128,6 +129,14 @@ class CourseSchedulerApp(QMainWindow):
         nav_layout.addWidget(self.next_btn)
         generate_layout.addWidget(nav_frame)
         
+        lock_frame = QFrame()
+        lock_layout = QHBoxLayout(lock_frame)
+        self.clear_locks_btn = QPushButton("清除所有时间锁定")
+        self.show_locks_btn = QPushButton("显示锁定时间段（双击表格单元格锁定/解锁）")
+        lock_layout.addWidget(self.clear_locks_btn)
+        lock_layout.addWidget(self.show_locks_btn)
+        generate_layout.addWidget(lock_frame)
+        
         center_layout.addWidget(generate_group)
         
         schedule_group = QGroupBox("课程表展示")
@@ -140,6 +149,8 @@ class CourseSchedulerApp(QMainWindow):
         self.schedule_table.setRowCount(11)
         self.schedule_table.setVerticalHeaderLabels([f"第{i+1}节" for i in range(11)])
         self.schedule_table.verticalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        
+        self.schedule_table.cellDoubleClicked.connect(self.toggle_time_slot_lock)
         
         schedule_layout.addWidget(self.schedule_table)
         center_layout.addWidget(schedule_group)
@@ -181,6 +192,67 @@ class CourseSchedulerApp(QMainWindow):
         self.available_search_btn.clicked.connect(self.search_available_courses)
         self.add_to_schedule_btn.clicked.connect(self.add_selected_available_course)
         self.export_btn.clicked.connect(self.export_to_excel)
+        self.clear_locks_btn.clicked.connect(self.clear_all_locks)
+        self.show_locks_btn.clicked.connect(self.show_locked_time_slots)
+    
+    def toggle_time_slot_lock(self, row, column):
+        day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        time_slot = f"第{row+1}节"
+        day_name = day_names[column]
+        is_currently_locked = np.any(self.locked_time_slots[:, column, row])
+        if is_currently_locked:
+            for week in range(16):
+                self.locked_time_slots[week, column, row] = False
+            self.update_table_appearance()
+            QMessageBox.information(self, "时间段解锁", f"已解锁 {day_name} {time_slot}")
+        else:
+            for week in range(16):
+                self.locked_time_slots[week, column, row] = True
+            self.update_table_appearance()
+            QMessageBox.information(self, "时间段锁定", f"已锁定 {day_name} {time_slot}")
+    
+    def update_table_appearance(self):
+        for day in range(7):
+            for time in range(11):
+                item = self.schedule_table.item(time, day)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.schedule_table.setItem(time, day, item)
+                
+                if np.any(self.locked_time_slots[:, day, time]):
+                    item.setBackground(QBrush(QColor(255, 200, 200)))
+                    item.setToolTip("该时间段已被锁定")
+                else:
+                    item.setBackground(QBrush(QColor(255, 255, 255)))  
+                    item.setToolTip("")
+    
+    def clear_all_locks(self):
+        reply = QMessageBox.question(
+            self, 
+            "确认清除",
+            "确定要清除所有时间锁定吗？",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            self.locked_time_slots = np.zeros((16, 7, 11), dtype=bool)
+            self.update_table_appearance()
+            QMessageBox.information(self, "成功", "已清除所有时间锁定")
+    
+    def show_locked_time_slots(self):
+        locked_slots = []
+        day_names = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+        
+        for day in range(7):
+            for time in range(11):
+                if np.any(self.locked_time_slots[:, day, time]):
+                    locked_slots.append(f"{day_names[day]} 第{time+1}节")
+        
+        if not locked_slots:
+            QMessageBox.information(self, "锁定时间段", "当前没有锁定的时间段")
+        else:
+            message = "当前锁定的时间段:\n\n" + "\n".join(locked_slots)
+            QMessageBox.information(self, "锁定时间段", message)
     
     def search_courses(self):
         keyword = self.search_input.text().strip()
@@ -288,6 +360,11 @@ class CourseSchedulerApp(QMainWindow):
                 self.add_course_to_selected(course)
     
     def add_course_to_selected(self, course):
+        if np.any(np.logical_and(self.locked_time_slots, course[2])):
+            QMessageBox.warning(self, "时间冲突", 
+                               f"课程 '{course[0]}' 与锁定的时间段冲突，无法添加")
+            return
+        
         for i in range(self.selected_courses_list.count()):
             existing_item = self.selected_courses_list.item(i)
             existing_course = existing_item.data(Qt.UserRole)
@@ -331,109 +408,117 @@ class CourseSchedulerApp(QMainWindow):
         for course in self.filtered_courses:
             course_groups[course[0]].append(course) 
         
-        unique_schedules = set()
+        self.schedules = []
+        max_courses = 0
+        
+        def find_max_courses(group_keys, index, current_count, combined_schedule):
+            nonlocal max_courses
+            
+            if index >= len(group_keys):
+                if current_count > max_courses:
+                    max_courses = current_count
+                return
+            
+            find_max_courses(group_keys, index + 1, current_count, combined_schedule)
+            
+            current_group = course_groups[group_keys[index]]
+            for course in current_group:
+                if (not np.any(np.logical_and(combined_schedule[0], course[2][0])) and \
+                   not np.any(np.logical_and(self.locked_time_slots, course[2]))):
+                    new_schedule = np.logical_or(combined_schedule, course[2])
+                    find_max_courses(group_keys, index + 1, current_count + 1, new_schedule)
+        
+        group_keys = list(course_groups.keys())
+        find_max_courses(group_keys, 0, 0, np.zeros((16, 7, 11), dtype=bool))
+        
+        if max_courses == 0:
+            QMessageBox.warning(self, "提示", "没有找到有效的课程表组合（可能与锁定的时间段冲突）")
+            return
+        
         current_schedule = []
         combined_schedule = np.zeros((16, 7, 11), dtype=bool)
         
-        def is_maximal(schedule):
-            current_schedule_slots = np.zeros((16, 7, 11), dtype=bool)
-            for course in schedule:
-                current_schedule_slots = np.logical_or(current_schedule_slots, course[2])
-            
-            for group_name, group_courses in course_groups.items():
-                if any(c[0] == group_name for c in schedule):
-                    continue
-                
-                for course in group_courses:
-                    if not np.any(np.logical_and(current_schedule_slots[0], course[2][0])):
-                        return False
-            return True
-        
-        def backtrack(group_keys, index):
+        def backtrack_maximal(group_keys, index):
             nonlocal combined_schedule
             
-            if len(current_schedule) > 0:
-                if is_maximal(current_schedule):
-                    schedule_key = tuple(
-                        (c[0], c[1], tuple(zip(*np.where(c[2])))) 
-                        for c in sorted(current_schedule, key=lambda x: x[0])
-                    )
-                    if schedule_key not in unique_schedules:
-                        unique_schedules.add(schedule_key)
-                        self.schedules.append([course for course in current_schedule])
-                        if len(self.schedules) >= 100:
-                            return True
+            if len(current_schedule) == max_courses:
+                schedule_key = tuple(
+                    (c[0], c[1], tuple(zip(*np.where(c[2])))) 
+                    for c in sorted(current_schedule, key=lambda x: x[0])
+                )
+                if schedule_key not in self.schedules:
+                    self.schedules.append([course for course in current_schedule])
+                return
             
             if index >= len(group_keys):
-                return False
+                return
+            
+            backtrack_maximal(group_keys, index + 1)
             
             current_group = course_groups[group_keys[index]]
-            
-            should_stop = backtrack(group_keys, index + 1)
-            if should_stop:
-                return True
-            
             for course in current_group:
-                if not np.any(np.logical_and(combined_schedule[0], course[2][0])):
+                if (not np.any(np.logical_and(combined_schedule[0], course[2][0])) and \
+                   not np.any(np.logical_and(self.locked_time_slots, course[2]))):
                     current_schedule.append(course)
                     old_schedule = combined_schedule.copy()
                     combined_schedule = np.logical_or(combined_schedule, course[2])
                     
-                    should_stop = backtrack(group_keys, index + 1)
-                    if should_stop:
-                        return True
+                    backtrack_maximal(group_keys, index + 1)
                     
                     current_schedule.pop()
                     combined_schedule = old_schedule
-            return False
         
-        self.schedules = []
-        group_keys = list(course_groups.keys())
-        backtrack(group_keys, 0)
+        backtrack_maximal(group_keys, 0)
         
-        self.schedules.sort(key=lambda s: -len(s))
-        
-        self.schedule_count_label.setText(f"找到 {len(self.schedules)} 个有效课程表")
+        self.schedule_count_label.setText(f"找到 {len(self.schedules)} 个包含 {max_courses} 门课程的有效课程表")
         
         if self.schedules:
             self.current_schedule_idx = 0
             self.show_schedule(self.current_schedule_idx)
             self.update_nav_buttons()
             
-            max_courses = len(self.schedules[0])
-            detail = f"最多课程的组合包含 {max_courses} 门课程:\n"
-            for course in self.schedules[0]:
-                time_sig = tuple(zip(*np.where(course[2])))[:3] 
-                detail += f"- {course[0]} ({course[1]})\n"
+            detail = f"找到 {len(self.schedules)} 个包含 {max_courses} 门课程的课程表:\n"
+            for i, course in enumerate(self.schedules[0]):
+                detail += f"{i+1}. {course[0]} ({course[1]})\n"
             
-            QMessageBox.information(self, "提示", 
-                f"成功生成 {len(self.schedules)} 个有效课程表\n\n" + detail)
+            QMessageBox.information(self, "提示", detail)
         else:
-            QMessageBox.warning(self, "提示", "没有找到有效的课程表组合")
+            QMessageBox.warning(self, "提示", "没有找到有效的课程表组合（可能与锁定的时间段冲突）")
     
     def show_schedule(self, idx):
         if 0 <= idx < len(self.schedules):
             self.export_btn.setEnabled(True)
             schedule = self.schedules[idx]
-            course_list_text = "当前课程表包含:\n"
+            
+            weekly_schedule = defaultdict(lambda: defaultdict(list))
+            
             for course in schedule:
-                course_list_text += f"- {course[0]} ({course[1]})\n  时间: {course[3]}\n\n"
-            weekly_schedule = np.zeros((16, 7, 11), dtype=bool)
-            for course in schedule:
-                weekly_schedule = np.logical_or(weekly_schedule, course[2])
+                for week in range(16):
+                    for day in range(7):
+                        for time in range(11):
+                            if course[2][week, day, time]:
+                                course_info = f"{course[0]}({course[1]})"
+                                weekly_schedule[day][time].append(course_info)
+            
             self.schedule_table.clearContents()
             for day in range(7):
                 for time in range(11):
-                    if weekly_schedule[0, day, time]:
+                    courses_in_slot = weekly_schedule[day][time]
+                    if courses_in_slot:
                         item = QTableWidgetItem()
                         item.setTextAlignment(Qt.AlignCenter)
-                        courses_in_slot = []
-                        for course in schedule:
-                            if course[2][0, day, time]:
-                                courses_in_slot.append(f"{course[0]}({course[1]})")
                         
-                        item.setText("\n".join(courses_in_slot))
+                        unique_courses = sorted(set(courses_in_slot))
+                        item.setText("\n".join(unique_courses))
+                        
+                        if len(unique_courses) > 1:
+                            item.setBackground(QBrush(QColor(255, 220, 200)))
+                        else:
+                            item.setBackground(QBrush(QColor(200, 255, 200))) 
+                        
                         self.schedule_table.setItem(time, day, item)
+            
+            self.update_table_appearance()
         else:
             self.export_btn.setEnabled(False)
     
@@ -477,9 +562,10 @@ class CourseSchedulerApp(QMainWindow):
                 query in course[3].lower()
             )
             
-            conflicts = np.any(np.logical_and(booked_slots, course[2]))
+            conflicts_with_schedule = np.any(np.logical_and(booked_slots, course[2]))
+            conflicts_with_locks = np.any(np.logical_and(self.locked_time_slots, course[2]))
             
-            if matches_query and not conflicts:
+            if matches_query and not conflicts_with_schedule and not conflicts_with_locks:
                 item = QListWidgetItem(f"{course[0]} - {course[1]}\n时间: {course[3]}")
                 item.setData(Qt.UserRole, course)
                 self.available_courses_list.addItem(item)
@@ -501,6 +587,11 @@ class CourseSchedulerApp(QMainWindow):
             QMessageBox.warning(self, "警告", f"课程'{course[0]}'已存在于当前课表中！")
             return
         
+        if np.any(np.logical_and(self.locked_time_slots, course[2])):
+            QMessageBox.warning(self, "时间冲突", 
+                               f"课程 '{course[0]}' 与锁定的时间段冲突，无法添加")
+            return
+        
         current_schedule.append(course)
         
         self.show_schedule(self.current_schedule_idx)
@@ -517,6 +608,7 @@ class CourseSchedulerApp(QMainWindow):
             options = QFileDialog.Options()
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             default_filename = f"课程表_{timestamp}.xlsx"
+            
             filename, _ = QFileDialog.getSaveFileName(
                 self, 
                 "选择保存位置", 
@@ -524,15 +616,18 @@ class CourseSchedulerApp(QMainWindow):
                 "Excel文件 (*.xlsx)", 
                 options=options
             )
+            
             if not filename:
                 return
             
             if not filename.endswith('.xlsx'):
                 filename += '.xlsx'
+            
             schedule = self.schedules[self.current_schedule_idx]
             weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
             periods = [f"第{i+1}节" for i in range(11)]
             timetable = [["" for _ in range(7)] for _ in range(11)]
+            
             for course in schedule:
                 course_name = f"{course[0]}\n({course[1]})"
                 for day in range(7):
@@ -544,13 +639,11 @@ class CourseSchedulerApp(QMainWindow):
                                 timetable[period][day] = course_name
 
             df = pd.DataFrame(timetable, columns=weekdays, index=periods)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"课程表_{timestamp}.xlsx"
             
             with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-                df.to_excel(writer, index=True)
+                df.to_excel(writer, index=True, sheet_name='课程表')
                 
-                worksheet = writer.sheets['Sheet1']
+                worksheet = writer.sheets['课程表']
                 worksheet.column_dimensions['A'].width = 8
                 for col in range(1, 8): 
                     column_letter = get_column_letter(col + 1)
@@ -558,10 +651,13 @@ class CourseSchedulerApp(QMainWindow):
                     
                 for row in worksheet.iter_rows():
                     for cell in row:
-                        cell.alignment = Alignment(wrap_text=True, vertical='center')
+                        cell.alignment = Alignment(wrap_text=True, vertical='center', horizontal='center')
             
-            QMessageBox.information(self, "导出成功", f"课程表已成功导出到:\n{os.path.abspath(filename)}")
+            QMessageBox.information(self, "导出成功", f"课程表已成功导出到:\n{filename}")
         
+        except PermissionError:
+            QMessageBox.critical(self, "权限错误", 
+                            f"没有权限写入文件:\n{filename}\n\n请尝试选择其他位置或关闭已打开的文件。")
         except ImportError:
             QMessageBox.critical(self, "错误", "导出失败: 请先安装pandas和openpyxl库\n\n在命令行运行:\npip install pandas openpyxl")
         except Exception as e:
@@ -744,7 +840,7 @@ if __name__ == "__main__":
     JSESSIONID = ""
     while route == "" or JSESSIONID == "":
         user_name = input("请输入tis账号: ")
-        pwd = getpass.getpass("请输入tis密码: ")
+        pwd = getpass.getpass("请输入tis密码(密码不会显示): ")
         route, JSESSIONID = login(user_name, pwd, header)
         if route == "" or JSESSIONID == "":
             print("登陆失败，请检查用户名和密码或网络连接。")
